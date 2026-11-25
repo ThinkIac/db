@@ -1,0 +1,114 @@
+{execFile, spawn} = require 'node:child_process'
+{randomBytes, scryptSync, hkdfSync} = require 'node:crypto'
+{promisify} = require 'node:util'
+execFileAsync = promisify execFile
+SERVICE = 'logos.private-vault.v1'
+MASTER_KEY_BYTES = 32
+
+class PrivateVaultUnavailableError extends Error
+  constructor: (message = 'Private database requires an OS keyring or an explicit in-memory unlock provider') ->
+    super message
+    @name = 'PrivateVaultUnavailableError'
+    @code = 'PRIVATE_VAULT_UNAVAILABLE'
+
+keyMaterial = (value) ->
+  output = if typeof value is 'string' then Buffer.from(value, 'utf8') else Buffer.from(value)
+  if output.length < MASTER_KEY_BYTES
+    throw new PrivateVaultUnavailableError 'Private vault master key must contain at least 32 bytes'
+  output
+
+execWithStdin = (command, args, input) ->
+  new Promise (resolve, reject) ->
+    child = spawn command, args, stdio: ['pipe', 'ignore', 'pipe']
+    stderr = ''
+    child.stderr.on 'data', (chunk) -> stderr += String chunk
+    child.once 'error', reject
+    child.once 'close', (code) ->
+      if code is 0 then resolve() else reject new Error(stderr.trim() or "#{command} exited with #{code}")
+    child.stdin.end input
+
+# Preserve the platform adapters, including the existing macOS security CLI.
+platformKeyring = (account = 'default') ->
+  if process.platform is 'darwin'
+    return {
+      get: ->
+        try
+          {stdout} = await execFileAsync 'security', ['find-generic-password', '-w', '-s', SERVICE, '-a', account]
+          Buffer.from stdout.trim(), 'base64'
+        catch
+          null
+      set: (value) ->
+        await execFileAsync 'security', ['add-generic-password', '-U', '-s', SERVICE, '-a', account, '-w', value.toString('base64')]
+        return
+    }
+  if process.platform is 'linux'
+    return {
+      get: ->
+        try
+          {stdout} = await execFileAsync 'secret-tool', ['lookup', 'service', SERVICE, 'account', account]
+          Buffer.from stdout.trim(), 'base64'
+        catch
+          null
+      set: (value) ->
+        await execWithStdin 'secret-tool', ['store', '--label=Lógos private vault', 'service', SERVICE, 'account', account], value.toString('base64')
+        return
+    }
+  null
+
+class PrivateVault
+  constructor: (@options = {}) ->
+    @masterKey = null
+    @keyring = if @options.keyring is undefined then platformKeyring() else @options.keyring
+    @random = @options.randomBytes ? randomBytes
+
+  unlock: ->
+    return @masterKey if @masterKey
+    supplied = await @options.masterKeyProvider?()
+    return @masterKey = keyMaterial(supplied) if supplied
+    fromKeyring = await @keyring?.get()
+    return @masterKey = keyMaterial(fromKeyring) if fromKeyring?.length
+    password = await @options.passwordProvider?()
+    if password
+      return @masterKey = scryptSync password, SERVICE, MASTER_KEY_BYTES, {N: 1 << 17, r: 8, p: 1, maxmem: 256 * 1024 * 1024}
+    throw new PrivateVaultUnavailableError() unless @keyring
+    generated = @random MASTER_KEY_BYTES
+    try
+      await @keyring.set generated
+      @masterKey = Buffer.from generated
+    catch error
+      generated.fill 0
+      throw new PrivateVaultUnavailableError "OS keyring could not store the private vault key: #{error?.message ? 'unknown error'}"
+
+  # Callers erase the derived key after handing it to the driver.
+  keyFor: (packageName) ->
+    unless /^[a-z0-9][a-z0-9._-]*$/.test packageName
+      throw new TypeError 'Private vault package name is invalid'
+    master = await @unlock()
+    Buffer.from hkdfSync('sha256', master, Buffer.from(SERVICE), Buffer.from("package:#{packageName}"), MASTER_KEY_BYTES)
+
+openSqlCipherDatabase = (databasePath, key) ->
+  database = undefined
+  try
+    Database = require 'better-sqlite3-multiple-ciphers'
+    database = new Database databasePath
+    database.pragma "cipher = 'sqlcipher'"
+    database.pragma 'legacy = 4'
+    unless typeof database.key is 'function'
+      throw new Error 'SQLCipher driver does not expose key(Buffer)'
+    database.key key
+    database.pragma 'kdf_iter = 256000'
+    database.pragma 'cipher_memory_security = ON'
+    database.pragma 'secure_delete = ON'
+    database.prepare('SELECT count(*) AS count FROM sqlite_master').get()
+    database
+  catch error
+    try
+      database?.close()
+    catch
+      undefined
+    throw error
+  finally
+    key.fill 0
+
+Object.defineProperty exports, '__esModule', value: true
+Object.assign exports, {PrivateVault, PrivateVaultUnavailableError, platformKeyring, openSqlCipherDatabase}

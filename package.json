@@ -1,0 +1,51 @@
+{
+  "name": "@thinkiac/module-db",
+  "version": "0.1.0",
+  "description": "Reusable multi-tenant Scriba database lifecycle",
+  "main": "index.cjs",
+  "dependencies": {
+    "better-sqlite3-multiple-ciphers": "^13.0.3",
+    "@thinkiac/module-runtime-compat": "git+https://github.com/ThinkIac/runtime-compat.git#cdc7111e66614bb1ed4a80901b3363587b3e6f0a"
+  },
+  "files": [
+    "index.cjs",
+    "src",
+    "dist",
+    "scripts",
+    "docs",
+    "README.md",
+    "LICENSE",
+    "*.d.cts",
+    "private-vault.cjs",
+    "schema-composer.cjs"
+  ],
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/*.test.cjs",
+    "test:isolated": "node scripts/isolated.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "runtime": {
+    "role": "module",
+    "entry": "index.cjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThinkIac/db.git"
+  },
+  "devDependencies": {
+    "logostype": "git+https://github.com/ThinkIac/LogosType.git#acdcc6032ab94219e0d4a4d25b1538fb55fa19cf"
+  },
+  "peerDependencies": {
+    "scriba": "*"
+  },
+  "peerDependenciesMeta": {
+    "scriba": {
+      "optional": true
+    }
+  }
+}

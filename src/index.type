@@ -1,0 +1,220 @@
+fs = require 'fs'
+path = require 'path'
+{createRequire} = require 'module'
+
+createDatabase = (host) ->
+  scriba = null
+  tried = false
+  loadError = null
+  valid = (value) -> /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test value
+  missing = (error) -> error and error.code is 'MODULE_NOT_FOUND' and /Cannot find module ['\"]scriba['\"]/.test(error.message)
+  instantiate = (module) ->
+    Type = module and (module.default or module)
+    throw new Error 'SCRIBA_INCOMPATIBLE_API: default export is not a constructor' unless typeof Type is 'function'
+    instance = new Type
+    absent = ['addTenant', 'entity', 'tenants'].filter (name) -> typeof instance[name] isnt 'function'
+    throw new Error "SCRIBA_INCOMPATIBLE_API: missing #{absent.join(', ')}" if absent.length
+    instance
+
+  loadScribaFrom = (root) ->
+    current = root
+    last = undefined
+    loop
+      try
+        return instantiate createRequire(path.join(current, 'package.json'))('scriba')
+      catch error
+        throw error if not missing(error) and not (error and String(error.message).startsWith 'SCRIBA_INCOMPATIBLE_API')
+        last = last or error
+      parent = path.dirname current
+      break if parent is current
+      current = parent
+    try
+      instantiate require 'scriba'
+    catch error
+      throw error if not missing(error) and not (error and String(error.message).startsWith 'SCRIBA_INCOMPATIBLE_API')
+      throw last or error
+
+  getScriba = ->
+    return scriba if tried
+    tried = true
+    try
+      scriba = loadScribaFrom host.applicationRoot()
+    catch error
+      incompatible = error and String(error.message).startsWith 'SCRIBA_INCOMPATIBLE_API'
+      message = if missing(error) then 'SCRIBA_MODULE_MISSING' else if incompatible then error.message else 'SCRIBA_INITIALIZATION_FAILED'
+      loadError = new Error message, {cause: error}
+      host.log "[db] #{loadError.message}"
+      host.appendLog 'logos', 'db:initialize', loadError
+      scriba = null
+    scriba
+
+  resolveDatabasePath = (folder, dir) ->
+    dataDir = host.dataDir()
+    return path.join(dir, '.database') unless dataDir
+    target = path.join dataDir, 'db', folder
+    fs.mkdirSync target, recursive: true
+    path.join target, '.database'
+
+  vault = (container) ->
+    state = container.state 'private-vault'
+    instance = state.get 'instance'
+    unless instance
+      instance = host.createVault(container.config and container.config.privateVault or {})
+      state.set 'instance', instance
+    instance
+
+  openPrivate = (container, filename, key) ->
+    factory = container.config and container.config.privateVault and container.config.privateVault.databaseFactory
+    try
+      if factory then factory(filename, key) else host.openPrivateDatabase(filename, key)
+    finally
+      key.fill 0
+
+  addTenant = ({packageName, dir}) ->
+    instance = getScriba()
+    if instance
+      instance.addTenant {id: packageName, path: resolveDatabasePath(packageName, dir), schema: host.composeSchema(dir)?.outputPath or "#{dir}/schema.prisma", watchSchema: false}
+    return
+
+  getProxy = (tenant) ->
+    authority = host.currentAuthority()
+    authority.access and authority.access.enforce {principal: authority.principal, surface: 'database', operation: 'access', resource: tenant}
+    new Proxy {}, {
+      get: (_target, entity) ->
+        return unless typeof entity is 'string'
+        instance = getScriba()
+        throw loadError or new Error('SCRIBA_UNAVAILABLE') unless instance
+        instance.entity entity, tenant
+    }
+
+  getDocuments = (container, tenant) ->
+    authority = host.currentAuthority()
+    authority.access and authority.access.enforce {principal: authority.principal, surface: 'database', operation: 'access', resource: tenant}
+    throw new Error 'INVALID_DATABASE_TENANT' unless valid tenant
+    pkg = container.registry.getPackage tenant
+    throw new Error 'DATABASE_PACKAGE_NOT_FOUND' unless fs.existsSync path.join(pkg.dir, 'package.json')
+    instance = getScriba()
+    throw new Error 'SCRIBA_DOCUMENTS_UNAVAILABLE' unless instance and instance.documents
+    pending = container.state 'db:documents'
+    unless pending.has tenant
+      open = do ->
+        # Preserve asynchronous opening and sharing of concurrent requests.
+        await undefined if false
+        unless instance.tenants().includes tenant
+          throw new Error 'DATABASE_NOT_READY' if fs.existsSync path.join(pkg.dir, 'schema.prisma')
+          filename = resolveDatabasePath tenant, pkg.dir
+          if pkg.database is 'private'
+            key = await vault(container).keyFor tenant
+            unless instance.tenants().includes tenant
+              instance.addTenant {id: tenant, path: filename, databaseFactory: -> openPrivate(container, filename, key)}
+          else
+            instance.addTenant {id: tenant, path: filename}
+        instance.documents tenant
+      pending.set tenant, open
+      open.catch -> pending.delete tenant if pending.get(tenant) is open
+    await pending.get tenant
+
+  install = (container) ->
+    registered = container.state 'db'
+    container.bus.on 'package:wiring', (payload) ->
+      pkg = payload.pkg
+      return if registered.has pkg.folder
+      try
+        composed = host.composeSchema pkg.dir
+      catch err
+        host.appendLog pkg.folder, 'db:composeSchema', err
+        return
+      return unless composed
+      instance = getScriba()
+      return unless instance
+      try
+        filename = resolveDatabasePath pkg.folder, pkg.dir
+        if pkg.database is 'private'
+          key = await vault(container).keyFor pkg.folder
+          await instance.addTenant {id: pkg.folder, path: filename, schema: composed.outputPath, watchSchema: false, databaseFactory: -> openPrivate(container, filename, key)}
+        else
+          await instance.addTenant {id: pkg.folder, path: filename, schema: composed.outputPath, watchSchema: false}
+        registered.set pkg.folder, true
+        await container.bus.emit 'db:schema_composed', {pkg: pkg.folder, sources: composed.sources.map (source) -> path.relative(pkg.dir, source)}
+      catch err
+        host.appendLog pkg.folder, 'db:addTenant', err
+      return
+    , {priority: 20}
+    container.bus.on 'db:schema_changed', (payload) ->
+      folder = payload and payload.pkg
+      return unless folder and registered.has folder
+      pkg = container.registry.getPackage folder
+      try
+        composed = host.composeSchema pkg.dir
+        return unless composed
+        instance = getScriba()
+        throw new Error 'SCRIBA_SCHEMA_RELOAD_UNAVAILABLE' unless instance and instance.reloadTenantSchema
+        await instance.reloadTenantSchema folder, composed.outputPath
+        await container.bus.emit 'db:schema_composed', {pkg: folder, sources: composed.sources.map (source) -> path.relative(pkg.dir, source)}
+      catch err
+        host.appendLog folder, 'db:reloadSchema', err
+        await container.bus.emit 'db:schema_compose_failed', {pkg: folder, error: if err instanceof Error then err.message else String(err)}
+        throw err
+      return
+    , {priority: 20}
+    container.bus.once 'runtime:packages_wired', ->
+      try
+        instance = getScriba()
+        instance and instance._injectGlobals and instance._injectGlobals()
+      catch
+        undefined
+      return
+    return
+
+  {loadScribaFrom, resolveDatabasePath, getScriba, addTenant, getProxy, getDocuments, install}
+
+provideDb = (host) ->
+  ###
+  @register module db
+  @context capability
+  ###
+  db = createDatabase {
+    applicationRoot: host.applicationRoot, dataDir: host.dataDir
+    composeSchema: require('./schema-composer.cjs').composePackageSchema
+    appendLog: host.appendLog, currentAuthority: host.currentAuthority
+    createVault: (options) -> new (require('./private-vault.cjs').PrivateVault)(options)
+    openPrivateDatabase: require('./private-vault.cjs').openSqlCipherDatabase
+    log: host.log
+  }
+  {
+    name: 'db', phase: 'boot', swappable: false
+    api: db
+    capabilities:
+      database: (request, context) ->
+        throw new Error 'An isolated package can only access its own database' unless request.tenant is context.package
+        if request.operation is 'index'
+          unless typeof request.entity is 'string' and typeof request.key is 'string'
+            throw new Error 'Invalid database index request'
+          table = db.getProxy(context.package)[request.entity]
+          record = table[request.key]
+          return undefined if record is undefined
+          unless record and typeof record.toJSON is 'function'
+            throw new Error 'Database index did not resolve a record'
+          return Object.fromEntries table._fields.map (field) -> [field.name, record[field.name]]
+        unless typeof request.entity is 'string' and typeof request.method is 'string' and Array.isArray request.args
+          throw new Error 'Invalid database capability request'
+        method = db.getProxy(context.package)?[request.entity]?[request.method]
+        throw new Error "Unknown database operation: #{request.entity}.#{request.method}" unless typeof method is 'function'
+        method request.args...
+    install: ->
+      # The host supplies protocol ports; no Logos internals are imported.
+      db.install {state: host.state, bus: {on: host.on, once: host.once, emit: host.emit}, registry: host.registry, config: host.config()}
+      return
+  }
+
+requireCapabilityDependency = (name, local) ->
+  try
+    entry = require.resolve name
+  catch error
+    throw error unless error.code is 'MODULE_NOT_FOUND'
+    entry = require.resolve local
+  require entry
+
+module.exports = {createDatabase, provideDb}
+module.exports.createHost = (args...) -> requireCapabilityDependency('@thinkiac/module-runtime-compat', '../runtime-compat').createHost args...
+module.exports.createRuntimeModule = provideDb
